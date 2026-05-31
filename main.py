@@ -1,99 +1,92 @@
 import os
+import re
 import json
 import httpx
-import asyncio
+import base64
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import anthropic
 
 app = FastAPI()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# Cache de PDFs já lidos
 pdf_cache = {}
 
-async def fetch_pdf_text(url: str) -> str:
-    """Descarrega e extrai texto de um PDF"""
+async def fetch_pdf(url: str):
     if url in pdf_cache:
         return pdf_cache[url]
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
-                # Envia o PDF para a API do Claude como documento
                 pdf_cache[url] = resp.content
                 return resp.content
     except Exception as e:
-        print(f"Erro a ler PDF {url}: {e}")
+        print(f"Erro PDF {url}: {e}")
     return None
 
-async def find_pdf_urls_from_zantia(query: str) -> list:
-    """Procura PDFs relevantes no zantia.com usando a pesquisa do site"""
+async def find_pdfs_on_zantia(query: str) -> list:
     urls = []
     try:
         search_url = f"https://www.zantia.com/?s={query.replace(' ', '+')}"
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(search_url, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
-                html = resp.text
-                # Extrair URLs de PDFs do HTML
-                import re
-                pdf_urls = re.findall(r'https://www\.zantia\.com/storage/[^"\'>\s]+\.pdf', html)
-                urls = list(set(pdf_urls))[:3]  # máximo 3 PDFs
+                found = re.findall(r'https://www\.zantia\.com/storage/[^"\'>\s]+\.pdf', resp.text)
+                urls = list(set(found))[:2]
     except Exception as e:
-        print(f"Erro na pesquisa: {e}")
+        print(f"Erro pesquisa: {e}")
     return urls
 
-async def ask_claude_with_pdfs(question: str, pdf_urls: list) -> str:
-    """Pergunta ao Claude com os PDFs como contexto"""
+async def ask_gemini(question: str, pdf_urls: list) -> str:
     try:
-        # Construir mensagem com PDFs
-        content = []
+        parts = []
 
-        # Adicionar PDFs como documentos
+        # Adicionar PDFs como inline_data
         for url in pdf_urls:
-            pdf_data = await fetch_pdf_text(url)
+            pdf_data = await fetch_pdf(url)
             if pdf_data:
-                import base64
-                content.append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": base64.standard_b64encode(pdf_data).decode("utf-8")
-                    },
-                    "title": url.split("/")[-1],
-                    "cache_control": {"type": "ephemeral"}
+                parts.append({
+                    "inline_data": {
+                        "mime_type": "application/pdf",
+                        "data": base64.b64encode(pdf_data).decode("utf-8")
+                    }
                 })
 
-        # Adicionar a pergunta
-        content.append({
-            "type": "text",
-            "text": question
+        # Adicionar instrução + pergunta
+        parts.append({
+            "text": f"""És o assistente de apoio técnico da Zantia, empresa portuguesa de energia e climatização.
+Respondes sempre em português de Portugal, de forma clara e concisa.
+Baseia a tua resposta nos documentos fornecidos.
+Se não encontrares a informação, diz que não tens essa informação e sugere visitar www.zantia.com ou ligar para a Zantia.
+Mantém a resposta curta (máximo 200 palavras), adequada para Telegram.
+
+Pergunta do utilizador: {question}"""
         })
 
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system="""És o assistente de apoio técnico da Zantia Formação. 
-Respondes em português de Portugal de forma clara e concisa.
-Baseias as tuas respostas nos manuais e documentos fornecidos.
-Se não encontrares a informação nos documentos, diz que não tens essa informação disponível e sugere contactar a Zantia diretamente em www.zantia.com.
-Mantém as respostas curtas e práticas, adequadas para Telegram (máximo 300 palavras).""",
-            messages=[{"role": "user", "content": content}]
-        )
-        return response.content[0].text
-    except Exception as e:
-        print(f"Erro Claude: {e}")
-        return "Ocorreu um erro ao processar a tua pergunta. Tenta novamente ou visita www.zantia.com."
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 512
+            }
+        }
 
-async def send_telegram_message(chat_id: int, text: str):
-    """Envia mensagem pelo Telegram"""
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(GEMINI_URL, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                print(f"Gemini erro: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"Erro Gemini: {e}")
+    return "Desculpe, ocorreu um erro ao processar a sua pergunta. Tente novamente ou visite www.zantia.com"
+
+async def send_message(chat_id: int, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json={
             "chat_id": chat_id,
@@ -102,7 +95,6 @@ async def send_telegram_message(chat_id: int, text: str):
         })
 
 async def send_typing(chat_id: int):
-    """Mostra indicador de digitação"""
     async with httpx.AsyncClient() as client:
         await client.post(f"{TELEGRAM_API}/sendChatAction", json={
             "chat_id": chat_id,
@@ -111,11 +103,8 @@ async def send_typing(chat_id: int):
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Recebe mensagens do Telegram"""
     try:
         data = await request.json()
-        print(f"Recebido: {json.dumps(data, ensure_ascii=False)[:200]}")
-
         message = data.get("message", {})
         if not message:
             return JSONResponse({"ok": True})
@@ -127,48 +116,49 @@ async def webhook(request: Request):
         if not chat_id or not text:
             return JSONResponse({"ok": True})
 
-        # Comandos especiais
         if text.startswith("/start"):
-            await send_telegram_message(chat_id,
-                f"👋 Olá {first_name}! Sou o assistente de apoio técnico da *Zantia Formação*.\n\n"
-                "Posso responder às tuas perguntas sobre os produtos e manuais disponíveis em www.zantia.com\n\n"
-                "💬 *Como posso ajudar-te hoje?*\n\n"
-                "Exemplos:\n"
-                "• Como instalar uma bomba de calor?\n"
-                "• Qual a potência do inversor X?\n"
-                "• Como configurar o termostato?")
+            await send_message(chat_id,
+                f"👋 Olá {first_name}! Sou o assistente de apoio técnico da *Zantia*.\n\n"
+                "Posso ajudar-te com dúvidas sobre os nossos produtos e manuais técnicos.\n\n"
+                "💬 Faz-me uma pergunta, por exemplo:\n"
+                "• _Como instalar uma bomba de calor?_\n"
+                "• _Qual a potência do inversor solar?_\n"
+                "• _Como configurar o termostato?_\n\n"
+                "🌐 Mais informação em www.zantia.com")
             return JSONResponse({"ok": True})
 
         if text.startswith("/help"):
-            await send_telegram_message(chat_id,
-                "ℹ️ *Apoio Zantia*\n\n"
-                "Faz-me qualquer pergunta sobre os produtos Zantia e eu vou procurar a resposta nos manuais técnicos.\n\n"
+            await send_message(chat_id,
+                "ℹ️ *Apoio Técnico Zantia*\n\n"
+                "Faz-me qualquer pergunta sobre os produtos Zantia e vou procurar a resposta nos manuais técnicos.\n\n"
                 "🌐 www.zantia.com")
             return JSONResponse({"ok": True})
 
         # Mostrar que está a processar
         await send_typing(chat_id)
 
-        # Procurar PDFs relevantes no zantia.com
-        pdf_urls = await find_pdf_urls_from_zantia(text)
+        # Procurar PDFs relevantes
+        pdf_urls = await find_pdfs_on_zantia(text)
 
-        # Se não encontrou PDFs específicos, usa o PDF de exemplo
+        # Se não encontrou, usar PDF de exemplo
         if not pdf_urls:
-            pdf_urls = ["https://www.zantia.com/storage/products/zmwbryvhni.pdf"]
+            pdf_urls = [
+                "https://www.zantia.com/storage/products_files/02/045/005/1/BphD9jzr3p-manualbellonapt.pdf",
+                "https://www.zantia.com/storage/products/esybor1tzu.pdf"
+            ]
 
-        # Obter resposta da IA com os PDFs
-        response_text = await ask_claude_with_pdfs(text, pdf_urls)
-
-        await send_telegram_message(chat_id, response_text)
+        # Resposta da IA
+        response = await ask_gemini(text, pdf_urls)
+        await send_message(chat_id, response)
 
     except Exception as e:
-        print(f"Erro no webhook: {e}")
+        print(f"Erro webhook: {e}")
 
     return JSONResponse({"ok": True})
 
 @app.get("/")
 async def root():
-    return {"status": "Zantia Bot online", "bot": "@ApoioZantiaBot"}
+    return {"status": "Zantia Bot online ✅", "bot": "@ApoioZantiaBot"}
 
 @app.get("/health")
 async def health():
