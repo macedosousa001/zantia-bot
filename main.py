@@ -29,7 +29,7 @@ Mantém a resposta curta (máximo 250 palavras), adequada para Telegram."""
 async def ask_groq(question: str) -> str:
     try:
         payload = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant",
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question}
