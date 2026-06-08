@@ -6,14 +6,11 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-async def ask_gemini(question: str) -> str:
-    try:
-        payload = {
-            "contents": [{"parts": [{"text": f"""És o assistente de apoio técnico da Zantia, empresa portuguesa especializada em energia e climatização.
+SYSTEM_PROMPT = """És o assistente de apoio técnico da Zantia, empresa portuguesa especializada em energia e climatização.
 
 A Zantia vende e instala:
 - Caldeiras a gás, gasóleo e pellets
@@ -26,21 +23,33 @@ A Zantia vende e instala:
 
 Responde SEMPRE em português de Portugal, de forma clara, prática e profissional.
 Dá conselhos técnicos úteis baseados no teu conhecimento sobre estes produtos.
-Se a pergunta for muito específica de um modelo, sugere contactar a Zantia em www.zantia.com ou pelo telefone.
-Mantém a resposta curta (máximo 250 palavras), adequada para Telegram.
+Se a pergunta for muito específica de um modelo, sugere contactar a Zantia em www.zantia.com.
+Mantém a resposta curta (máximo 250 palavras), adequada para Telegram."""
 
-Pergunta do utilizador: {question}"""}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 600}
+async def ask_groq(question: str) -> str:
+    try:
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question}
+            ],
+            "temperature": 0.4,
+            "max_tokens": 600
+        }
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
         }
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(GEMINI_URL, json=payload)
+            resp = await client.post(GROQ_URL, json=payload, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                return data["choices"][0]["message"]["content"]
             else:
-                print(f"Gemini erro {resp.status_code}: {resp.text[:200]}")
+                print(f"Groq erro {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"Erro Gemini: {e}")
+        print(f"Erro Groq: {e}")
     return "Desculpe, ocorreu um erro temporário. Por favor tente novamente ou contacte a Zantia em www.zantia.com"
 
 async def send_message(chat_id: int, text: str):
@@ -99,7 +108,7 @@ async def webhook(request: Request):
             return JSONResponse({"ok": True})
 
         await send_typing(chat_id)
-        response = await ask_gemini(text)
+        response = await ask_groq(text)
         await send_message(chat_id, response)
 
     except Exception as e:
